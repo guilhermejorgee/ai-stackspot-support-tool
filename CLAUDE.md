@@ -34,7 +34,7 @@ The project consists of a streamlined architecture:
 
 - **Authentication Endpoint**: `https://idm.stackspot.com/{realm}/oidc/oauth/token`
 - **Chat Endpoint**: `https://genai-code-buddy-api.stackspot.com/v3/chat`
-- **Agent ID**: `01J4WFMAJTP453TRRQKFAJ80PN` (configurable via environment)
+- **Agent ID**: `id-do-seu-agent` (configurable via environment)
 
 ## Key Features
 
