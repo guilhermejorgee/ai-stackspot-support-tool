@@ -5,7 +5,7 @@ import litellm
 # Once defined, these can be passed in proxy_config.yaml
 class MyCustomHandler(CustomLogger):
     def log_pre_api_call(self, model, messages, kwargs): 
-        print(f"Pre-API Call")
+        print(kwargs)
     
     def log_post_api_call(self, kwargs, response_obj, start_time, end_time): 
         print(f"Post-API Call")
@@ -18,6 +18,10 @@ class MyCustomHandler(CustomLogger):
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         print(f"On Async Success!")
+
+        
+
+        # print(kwargs)
         # log: key, user, model, prompt, response, tokens, cost
         # Access kwargs passed to litellm.completion()
         model = kwargs.get("model", None)
@@ -25,6 +29,16 @@ class MyCustomHandler(CustomLogger):
 
         # Access litellm_params passed to litellm.completion(), example access `metadata`
         litellm_params = kwargs.get("litellm_params", {})
+
+        print(f"Litellm Params: {litellm_params}")
+
+        metadata = litellm_params.get("metadata", {})
+
+        headers = metadata.get("headers", {})
+        header = headers.get("x-my-random-header", None)  # Example of accessing a custom
+
+        print(f"Header: {header}")
+
         metadata = litellm_params.get("metadata", {})   # headers passed to LiteLLM proxy, can be found here
 
         response = response_obj
@@ -33,7 +47,7 @@ class MyCustomHandler(CustomLogger):
 
         # print(kwargs["tools"])
 
-        print(response)
+        # print(response)
 
         # print(
         #     f"""
@@ -47,8 +61,8 @@ class MyCustomHandler(CustomLogger):
 
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time): 
         try:
-            print(f"On Async Failure !")
-            print("\nkwargs", kwargs)
+            # print(f"On Async Failure !")
+            # print("\nkwargs", kwargs)
             # Access kwargs passed to litellm.completion()
             model = kwargs.get("model", None)
             messages = kwargs.get("messages", None)
@@ -62,19 +76,19 @@ class MyCustomHandler(CustomLogger):
             exception_event = kwargs.get("exception", None)
             traceback_event = kwargs.get("traceback_exception", None)
 
-            print("now checking response obj")
+            # print("now checking response obj")
             
-            print(
-                f"""
-                    Model: {model},
-                    Messages: {messages},
-                    User: {user},
-                    Response: {response_obj}
-                    Proxy Metadata: {metadata}
-                    Exception: {exception_event}
-                    Traceback: {traceback_event}
-                """
-            )
+            # print(
+            #     f"""
+            #         Model: {model},
+            #         Messages: {messages},
+            #         User: {user},
+            #         Response: {response_obj}
+            #         Proxy Metadata: {metadata}
+            #         Exception: {exception_event}
+            #         Traceback: {traceback_event}
+            #     """
+            # )
         except Exception as e:
             print(f"Exception: {e}")
 

@@ -1,9 +1,12 @@
-import os, json, re, time, uuid, requests, litellm, sseclient
+import os, json, re, time, uuid, requests, litellm, sseclient, logging
 from dotenv import load_dotenv
 from litellm import CustomLLM, ModelResponse, completion
 from litellm.types.utils import GenericStreamingChunk
 from requests_sse import EventSource, InvalidStatusCodeError, InvalidContentTypeError
 from typing import Iterator, AsyncIterator
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 class StackspotLLM(CustomLLM):
@@ -121,6 +124,7 @@ class StackspotLLM(CustomLLM):
                     try:
                         function_name = match[0].strip()
                         arguments_str = match[1].strip()
+                        logger.debug(f"Detected tool call: {function_name} with args: {arguments_str[:100]}...")
                         
                         # Try to parse arguments as JSON
                         try:
@@ -236,10 +240,19 @@ class StackspotLLM(CustomLLM):
         clean_response = re.sub(r'TOOL_CALL_START.*?TOOL_CALL_END', '', clean_response, flags=re.DOTALL | re.IGNORECASE)
         clean_response = clean_response.strip()
         
+        if tool_calls:
+            logger.info(f"Found {len(tool_calls)} tool call(s): {[tc['function']['name'] for tc in tool_calls]}")
+        
         return tool_calls, clean_response
 
     def _prepare_streaming_request(self, messages, **kwargs):
         """Prepare common streaming request setup"""
+
+        try:
+            correlation_id = kwargs["litellm_params"]["metadata"]["headers"]["correlation-id"]
+        except KeyError:
+            raise KeyError("O header obrigatório 'correlation_id' está ausente.")  
+
         if not self.jwt:
             self.authenticate()
         
@@ -255,47 +268,63 @@ class StackspotLLM(CustomLLM):
             tools = optional_params.get("tools", None)
         
         user_prompt = self._convert_messages_to_prompt(messages, tools)
-        
+              
         payload = {
-            "streaming": True,
-            "user_prompt": user_prompt,
-            "stackspot_knowledge": False,
-            "return_ks_in_response": False
+            "context": {
+                "conversation_id": correlation_id,
+                "upload_ids": [],
+                "agent_id": "01J4WFMAJTP453TRRQKFAJ80PN",
+                "agent_built_in": True,
+                "os": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                "platform": "web-widget",
+                "platform_version": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                "stackspot_ai_version": "1.32.1"
+            },
+            "user_prompt": user_prompt
         }
         
         return url, headers, payload
 
     def _collect_completion_response(self, url, headers, payload, model):
         """Collect complete response from SSE for completion methods"""
+        logger.debug("Starting SSE completion request")
         # Use stream=True para SSE
         resp = requests.post(url, json=payload, headers=headers, stream=True)
         
         # Check if we have an error response
         if resp.status_code != 200:
+            logger.error(f"HTTP {resp.status_code} error from Stackspot API")
             resp.raise_for_status()
         
         answer_parts = []
 
-        with EventSource(url, timeout=30, headers=headers, json=payload, method="POST") as event_source:
-            try:
-                for event in event_source:
-                    if event.type == "end_event":
-                        break
-                    if event.type != "new_message":
-                        continue
-                    try:
-                        data = json.loads(event.data)
-                        if "answer" in data and data["answer"]:  # Only add non-empty answers
-                            answer_parts.append(data["answer"])
-                    except Exception as e:
-                        print(f"Error parsing event data: {e}")
-                        continue    
-            except (InvalidStatusCodeError, InvalidContentTypeError, requests.RequestException):
-                pass
+        try:
+            with EventSource(url, timeout=30, headers=headers, json=payload, method="POST") as event_source:
+                try:
+                    for event in event_source:
+                        if event.type == "end_event":
+                            logger.debug("Received end_event, completing response")
+                            break
+                        if event.type != "new_message":
+                            continue
+                        try:
+                            data = json.loads(event.data)
+                            if "answer" in data and data["answer"]:  # Only add non-empty answers
+                                answer_parts.append(data["answer"])
+                        except Exception as e:
+                            logger.warning(f"Error parsing event data: {e}")
+                            continue    
+                except (InvalidStatusCodeError, InvalidContentTypeError, requests.RequestException) as e:
+                    logger.error(f"SSE connection error: {e}")
+                    pass
 
-        event_source.close()    
+            event_source.close()    
+        except Exception as e:
+            logger.error(f"Unexpected error during SSE completion: {e}")
+            raise
 
         content = "".join(answer_parts)
+        logger.debug(f"Collected {len(answer_parts)} answer parts, total length: {len(content)}")
         tool_calls, clean_content = self._detect_tool_calls(content)
         return self._format_openai_response(model, clean_content, tool_calls)
 
@@ -347,48 +376,55 @@ class StackspotLLM(CustomLLM):
 
     def _process_streaming_events(self, url, headers, payload):
         """Process SSE events and yield streaming chunks"""
+        logger.debug("Starting SSE streaming request")
         accumulated_content = ""
         current_tool_calls = []
         
-        with EventSource(url, timeout=30, headers=headers, json=payload, method="POST") as event_source:
-            try:
-                for event in event_source:
-                    if event.type == "end_event":
-                        break
-                    if event.type != "new_message":
-                        continue
-                    try:
-                        data = json.loads(event.data)
-                        if "answer" in data and data["answer"]:
-                            chunk_text = data["answer"]
-                            accumulated_content += chunk_text
-                            
-                            # Check for tool calls in accumulated content
-                            tool_calls, clean_content = self._detect_tool_calls(accumulated_content)
-                            
-                            if tool_calls:
-                                # Stream tool calls progressively
-                                chunks = self._process_tool_calls_streaming(tool_calls, current_tool_calls)
-                                for chunk in chunks:
-                                    yield chunk
-                            else:
-                                # Regular text chunk
-                                if clean_content and not current_tool_calls:
-                                    chunk: GenericStreamingChunk = {
-                                        "finish_reason": None,
-                                        "index": 0,
-                                        "is_finished": False,
-                                        "text": chunk_text,
-                                        "tool_use": None,
-                                        "usage": {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0},
-                                    }
-                                    yield chunk
-                                    
-                    except Exception as e:
-                        print(f"Error parsing event data: {e}")
-                        continue    
-            except (InvalidStatusCodeError, InvalidContentTypeError, requests.RequestException):
-                pass
+        try:
+            with EventSource(url, timeout=30, headers=headers, json=payload, method="POST") as event_source:
+                try:
+                    for event in event_source:
+                        if event.type == "end_event":
+                            logger.debug("Received end_event, finalizing stream")
+                            break
+                        if event.type != "new_message":
+                            continue
+                        try:
+                            data = json.loads(event.data)
+                            if "answer" in data and data["answer"]:
+                                chunk_text = data["answer"]
+                                accumulated_content += chunk_text
+                                
+                                # Check for tool calls in accumulated content
+                                tool_calls, clean_content = self._detect_tool_calls(accumulated_content)
+                                
+                                if tool_calls:
+                                    # Stream tool calls progressively
+                                    chunks = self._process_tool_calls_streaming(tool_calls, current_tool_calls)
+                                    for chunk in chunks:
+                                        yield chunk
+                                else:
+                                    # Regular text chunk
+                                    if clean_content and not current_tool_calls:
+                                        chunk: GenericStreamingChunk = {
+                                            "finish_reason": None,
+                                            "index": 0,
+                                            "is_finished": False,
+                                            "text": chunk_text,
+                                            "tool_use": None,
+                                            "usage": {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0},
+                                        }
+                                        yield chunk
+                                        
+                        except Exception as e:
+                            logger.warning(f"Error parsing streaming event data: {e}")
+                            continue    
+                except (InvalidStatusCodeError, InvalidContentTypeError, requests.RequestException) as e:
+                    logger.error(f"SSE streaming connection error: {e}")
+                    pass
+        except Exception as e:
+            logger.error(f"Unexpected error during SSE streaming: {e}")
+            raise
 
         # Send final chunk
         if current_tool_calls:
@@ -439,6 +475,7 @@ class StackspotLLM(CustomLLM):
 
 
     def authenticate(self):
+        logger.debug(f"Authenticating with realm: {self.realm}")
         url = f"https://idm.stackspot.com/{self.realm}/oidc/oauth/token"
         data = {
             "grant_type": "client_credentials",
@@ -446,9 +483,14 @@ class StackspotLLM(CustomLLM):
             "client_secret": self.client_secret
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        resp = requests.post(url, data=data, headers=headers)
-        resp.raise_for_status()
-        self.jwt = resp.json()["access_token"]
+        try:
+            resp = requests.post(url, data=data, headers=headers)
+            resp.raise_for_status()
+            self.jwt = resp.json()["access_token"]
+            logger.info("Successfully authenticated with Stackspot IDM")
+        except requests.RequestException as e:
+            logger.error(f"Authentication failed: {e}")
+            raise
 
     def completion(self, model, messages, **kwargs):
         url, headers, payload = self._prepare_streaming_request(messages, **kwargs)
@@ -471,15 +513,15 @@ class StackspotLLM(CustomLLM):
 stackspot_llm = StackspotLLM()
 
 
-litellm.custom_provider_map = [ # 👈 KEY STEP - REGISTER HANDLER
-        {"provider": "my-custom-llm", "custom_handler": stackspot_llm}
-    ]
+# litellm.custom_provider_map = [ # 👈 KEY STEP - REGISTER HANDLER
+#         {"provider": "my-custom-llm", "custom_handler": stackspot_llm}
+#     ]
 
-resp = completion(
-        model="my-custom-llm/stackspot-chat",
-        stream=True,
-        messages=[{"role": "user", "content": "Hello world!"}])
+# resp = completion(
+#         model="my-custom-llm/stackspot-chat",
+#         stream=True,
+#         messages=[{"role": "user", "content": "Hello world!"}])
 
 
-for chunk in resp:
-    print(chunk)
+#  for chunk in resp:
+#      print(chunk)
