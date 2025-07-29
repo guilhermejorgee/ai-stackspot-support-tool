@@ -1,6 +1,7 @@
-import os, json, re, time, uuid, requests, httpx, litellm
+import os, json, re, time, uuid, requests, litellm, sseclient
 from dotenv import load_dotenv
-from litellm import CustomLLM, ModelResponse
+from litellm import CustomLLM, ModelResponse, completion
+from requests_sse import EventSource, InvalidStatusCodeError, InvalidContentTypeError
 
 
 class StackspotLLM(CustomLLM):
@@ -261,6 +262,7 @@ class StackspotLLM(CustomLLM):
         )
         return response
 
+
     def authenticate(self):
         url = f"https://idm.stackspot.com/{self.realm}/oidc/oauth/token"
         data = {
@@ -277,41 +279,61 @@ class StackspotLLM(CustomLLM):
         if not self.jwt:
             self.authenticate()
         
-        url = f"https://genai-inference-app.stackspot.com/v1/agent/{self.genai_agent_id}/chat"
+        url = f"https://genai-code-buddy-api.stackspot.com/v3/chat"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.jwt}"
         }
         
-        # Extract tools from kwargs if provided
         tools = kwargs.get("tools", None)
         if tools is None:
-            # Check if tools are in optional_params
             optional_params = kwargs.get("optional_params", {})
             tools = optional_params.get("tools", None)
         
-        # Convert messages to custom prompt
         user_prompt = self._convert_messages_to_prompt(messages, tools)
         
         payload = {
-            "streaming": False,
+            "streaming": True,
             "user_prompt": user_prompt,
             "stackspot_knowledge": False,
             "return_ks_in_response": False
         }
 
-        # print(f"[DEBUG] Sending request to {url} with payload: {json.dumps(payload, indent=2)}")
+        # Use stream=True para SSE
+        resp = requests.post(url, json=payload, headers=headers, stream=True)
+        
+        # Check if we have an error response
+        if resp.status_code != 200:
+            resp.raise_for_status()
+        
+        answer_parts = []
 
-        resp = requests.post(url, json=payload, headers=headers)
-        print(f"[DEBUG] Response status: {resp.status_code}, content: {resp.text}")
-        resp.raise_for_status()
-        result = resp.json()
-        content = result.get("message", "")
-        
-        # Detect tool calls in response
+        with EventSource(url, timeout=30, headers=headers, json=payload, method="POST") as event_source:
+            try:
+                for event in event_source:
+
+                    if event.type == "end_event":
+                        break
+                    if event.type != "new_message":
+                        continue
+                    try:
+                        data = json.loads(event.data)
+                        if "answer" in data and data["answer"]:  # Only add non-empty answers
+                            answer_parts.append(data["answer"])
+                    except Exception as e:
+                        print(f"Error parsing event data: {e}")
+                        continue    
+            except InvalidStatusCodeError:
+                pass
+            except InvalidContentTypeError:
+                pass
+            except requests.RequestException:
+                pass
+
+        event_source.close()    
+
+        content = "".join(answer_parts)
         tool_calls, clean_content = self._detect_tool_calls(content)
-        
-        # Format and return OpenAI-compatible response
         resposta = self._format_openai_response(model, clean_content, tool_calls)
         return resposta
 
@@ -320,45 +342,74 @@ class StackspotLLM(CustomLLM):
         if not self.jwt:
             self.authenticate()
         
-        url = f"https://genai-inference-app.stackspot.com/v1/agent/{self.genai_agent_id}/chat"
+        url = f"https://genai-code-buddy-api.stackspot.com/v3/chat"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.jwt}"
         }
         
-        # Extract tools from kwargs if provided
         tools = kwargs.get("tools", None)
         if tools is None:
-            # Check if tools are in optional_params
             optional_params = kwargs.get("optional_params", {})
             tools = optional_params.get("tools", None)
         
-        # Convert messages to custom prompt
         user_prompt = self._convert_messages_to_prompt(messages, tools)
         
         payload = {
-            "streaming": False,  # Use non-streaming for async completion to get full response
+            "streaming": True,
             "user_prompt": user_prompt,
             "stackspot_knowledge": False,
             "return_ks_in_response": False
         }
 
-        print(f"[DEBUG] Sending async request to {url} with payload: {json.dumps(payload, indent=2)}")
-
-        async with httpx.AsyncClient(timeout=None) as client:
-            resp = await client.post(url, json=payload, headers=headers)
+        # Use stream=True para SSE
+        resp = requests.post(url, json=payload, headers=headers, stream=True)
+        
+        # Check if we have an error response
+        if resp.status_code != 200:
             resp.raise_for_status()
-            result = resp.json()
-            content = result.get("message", "")
         
-        # Detect tool calls in response
+        answer_parts = []
+
+        with EventSource(url, timeout=30, headers=headers, json=payload, method="POST") as event_source:
+            try:
+                for event in event_source:
+
+                    if event.type == "end_event":
+                        break
+                    if event.type != "new_message":
+                        continue
+                    try:
+                        data = json.loads(event.data)
+                        if "answer" in data and data["answer"]:  # Only add non-empty answers
+                            answer_parts.append(data["answer"])
+                    except Exception as e:
+                        print(f"Error parsing event data: {e}")
+                        continue    
+            except InvalidStatusCodeError:
+                pass
+            except InvalidContentTypeError:
+                pass
+            except requests.RequestException:
+                pass
+
+        event_source.close()    
+
+        content = "".join(answer_parts)
         tool_calls, clean_content = self._detect_tool_calls(content)
-        
-        # Format and return OpenAI-compatible response
-        resp = self._format_openai_response(model, clean_content, tool_calls)
-        print(f"[DEBUG] Async response: {resp}")
-        return resp         
+        resposta = self._format_openai_response(model, clean_content, tool_calls)
+        return resposta     
 
 stackspot_llm = StackspotLLM()
 
 
+litellm.custom_provider_map = [ # 👈 KEY STEP - REGISTER HANDLER
+        {"provider": "my-custom-llm", "custom_handler": stackspot_llm}
+    ]
+
+resp = completion(
+        model="my-custom-llm/stackspot-chat",
+        messages=[{"role": "user", "content": "Hello world!"}])
+
+
+print(f"Response: {resp}")
