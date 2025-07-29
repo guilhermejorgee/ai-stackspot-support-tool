@@ -1,7 +1,9 @@
 import os, json, re, time, uuid, requests, litellm, sseclient
 from dotenv import load_dotenv
 from litellm import CustomLLM, ModelResponse, completion
+from litellm.types.utils import GenericStreamingChunk
 from requests_sse import EventSource, InvalidStatusCodeError, InvalidContentTypeError
+from typing import Iterator, AsyncIterator
 
 
 class StackspotLLM(CustomLLM):
@@ -236,6 +238,179 @@ class StackspotLLM(CustomLLM):
         
         return tool_calls, clean_response
 
+    def _prepare_streaming_request(self, messages, **kwargs):
+        """Prepare common streaming request setup"""
+        if not self.jwt:
+            self.authenticate()
+        
+        url = f"https://genai-code-buddy-api.stackspot.com/v3/chat"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.jwt}"
+        }
+        
+        tools = kwargs.get("tools", None)
+        if tools is None:
+            optional_params = kwargs.get("optional_params", {})
+            tools = optional_params.get("tools", None)
+        
+        user_prompt = self._convert_messages_to_prompt(messages, tools)
+        
+        payload = {
+            "streaming": True,
+            "user_prompt": user_prompt,
+            "stackspot_knowledge": False,
+            "return_ks_in_response": False
+        }
+        
+        return url, headers, payload
+
+    def _collect_completion_response(self, url, headers, payload, model):
+        """Collect complete response from SSE for completion methods"""
+        # Use stream=True para SSE
+        resp = requests.post(url, json=payload, headers=headers, stream=True)
+        
+        # Check if we have an error response
+        if resp.status_code != 200:
+            resp.raise_for_status()
+        
+        answer_parts = []
+
+        with EventSource(url, timeout=30, headers=headers, json=payload, method="POST") as event_source:
+            try:
+                for event in event_source:
+                    if event.type == "end_event":
+                        break
+                    if event.type != "new_message":
+                        continue
+                    try:
+                        data = json.loads(event.data)
+                        if "answer" in data and data["answer"]:  # Only add non-empty answers
+                            answer_parts.append(data["answer"])
+                    except Exception as e:
+                        print(f"Error parsing event data: {e}")
+                        continue    
+            except (InvalidStatusCodeError, InvalidContentTypeError, requests.RequestException):
+                pass
+
+        event_source.close()    
+
+        content = "".join(answer_parts)
+        tool_calls, clean_content = self._detect_tool_calls(content)
+        return self._format_openai_response(model, clean_content, tool_calls)
+
+    def _process_tool_calls_streaming(self, tool_calls, current_tool_calls):
+        """Process and yield tool call chunks progressively"""
+        chunks_to_yield = []
+        
+        for i, tool_call in enumerate(tool_calls):
+            if i >= len(current_tool_calls):
+                # New tool call detected
+                current_tool_calls.append({
+                    "index": i,
+                    "id": tool_call["id"],
+                    "type": tool_call["type"],
+                    "function": {
+                        "name": tool_call["function"]["name"],
+                        "arguments": ""
+                    }
+                })
+                
+                # Send initial chunk with function name
+                chunk: GenericStreamingChunk = {
+                    "finish_reason": None,
+                    "index": 0,
+                    "is_finished": False,
+                    "text": None,
+                    "tool_use": [current_tool_calls[i]],
+                    "usage": {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0},
+                }
+                chunks_to_yield.append(chunk)
+            
+            # Update arguments progressively
+            current_args = current_tool_calls[i]["function"]["arguments"]
+            new_args = tool_call["function"]["arguments"]
+            
+            if new_args != current_args:
+                current_tool_calls[i]["function"]["arguments"] = new_args
+                chunk: GenericStreamingChunk = {
+                    "finish_reason": None,
+                    "index": 0,
+                    "is_finished": False,
+                    "text": None,
+                    "tool_use": [current_tool_calls[i]],
+                    "usage": {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0},
+                }
+                chunks_to_yield.append(chunk)
+        
+        return chunks_to_yield
+
+    def _process_streaming_events(self, url, headers, payload):
+        """Process SSE events and yield streaming chunks"""
+        accumulated_content = ""
+        current_tool_calls = []
+        
+        with EventSource(url, timeout=30, headers=headers, json=payload, method="POST") as event_source:
+            try:
+                for event in event_source:
+                    if event.type == "end_event":
+                        break
+                    if event.type != "new_message":
+                        continue
+                    try:
+                        data = json.loads(event.data)
+                        if "answer" in data and data["answer"]:
+                            chunk_text = data["answer"]
+                            accumulated_content += chunk_text
+                            
+                            # Check for tool calls in accumulated content
+                            tool_calls, clean_content = self._detect_tool_calls(accumulated_content)
+                            
+                            if tool_calls:
+                                # Stream tool calls progressively
+                                chunks = self._process_tool_calls_streaming(tool_calls, current_tool_calls)
+                                for chunk in chunks:
+                                    yield chunk
+                            else:
+                                # Regular text chunk
+                                if clean_content and not current_tool_calls:
+                                    chunk: GenericStreamingChunk = {
+                                        "finish_reason": None,
+                                        "index": 0,
+                                        "is_finished": False,
+                                        "text": chunk_text,
+                                        "tool_use": None,
+                                        "usage": {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0},
+                                    }
+                                    yield chunk
+                                    
+                    except Exception as e:
+                        print(f"Error parsing event data: {e}")
+                        continue    
+            except (InvalidStatusCodeError, InvalidContentTypeError, requests.RequestException):
+                pass
+
+        # Send final chunk
+        if current_tool_calls:
+            final_chunk: GenericStreamingChunk = {
+                "finish_reason": "tool_calls",
+                "index": 0,
+                "is_finished": True,
+                "text": None,
+                "tool_use": current_tool_calls,
+                "usage": {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0},
+            }
+        else:
+            final_chunk: GenericStreamingChunk = {
+                "finish_reason": "stop",
+                "index": 0,
+                "is_finished": True,
+                "text": "",
+                "tool_use": None,
+                "usage": {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0},
+            }
+        yield final_chunk
+
     def _format_openai_response(self, model, content, tool_calls=None):
         """Format response in OpenAI format"""
         response = ModelResponse(
@@ -276,129 +451,22 @@ class StackspotLLM(CustomLLM):
         self.jwt = resp.json()["access_token"]
 
     def completion(self, model, messages, **kwargs):
-        if not self.jwt:
-            self.authenticate()
-        
-        url = f"https://genai-code-buddy-api.stackspot.com/v3/chat"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.jwt}"
-        }
-        
-        tools = kwargs.get("tools", None)
-        if tools is None:
-            optional_params = kwargs.get("optional_params", {})
-            tools = optional_params.get("tools", None)
-        
-        user_prompt = self._convert_messages_to_prompt(messages, tools)
-        
-        payload = {
-            "streaming": True,
-            "user_prompt": user_prompt,
-            "stackspot_knowledge": False,
-            "return_ks_in_response": False
-        }
-
-        # Use stream=True para SSE
-        resp = requests.post(url, json=payload, headers=headers, stream=True)
-        
-        # Check if we have an error response
-        if resp.status_code != 200:
-            resp.raise_for_status()
-        
-        answer_parts = []
-
-        with EventSource(url, timeout=30, headers=headers, json=payload, method="POST") as event_source:
-            try:
-                for event in event_source:
-
-                    if event.type == "end_event":
-                        break
-                    if event.type != "new_message":
-                        continue
-                    try:
-                        data = json.loads(event.data)
-                        if "answer" in data and data["answer"]:  # Only add non-empty answers
-                            answer_parts.append(data["answer"])
-                    except Exception as e:
-                        print(f"Error parsing event data: {e}")
-                        continue    
-            except InvalidStatusCodeError:
-                pass
-            except InvalidContentTypeError:
-                pass
-            except requests.RequestException:
-                pass
-
-        event_source.close()    
-
-        content = "".join(answer_parts)
-        tool_calls, clean_content = self._detect_tool_calls(content)
-        resposta = self._format_openai_response(model, clean_content, tool_calls)
-        return resposta
+        url, headers, payload = self._prepare_streaming_request(messages, **kwargs)
+        return self._collect_completion_response(url, headers, payload, model)
 
 
     async def acompletion(self, model, messages, **kwargs):
-        if not self.jwt:
-            self.authenticate()
-        
-        url = f"https://genai-code-buddy-api.stackspot.com/v3/chat"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.jwt}"
-        }
-        
-        tools = kwargs.get("tools", None)
-        if tools is None:
-            optional_params = kwargs.get("optional_params", {})
-            tools = optional_params.get("tools", None)
-        
-        user_prompt = self._convert_messages_to_prompt(messages, tools)
-        
-        payload = {
-            "streaming": True,
-            "user_prompt": user_prompt,
-            "stackspot_knowledge": False,
-            "return_ks_in_response": False
-        }
+        url, headers, payload = self._prepare_streaming_request(messages, **kwargs)
+        return self._collect_completion_response(url, headers, payload, model)
 
-        # Use stream=True para SSE
-        resp = requests.post(url, json=payload, headers=headers, stream=True)
-        
-        # Check if we have an error response
-        if resp.status_code != 200:
-            resp.raise_for_status()
-        
-        answer_parts = []
+    def streaming(self, model, messages, **kwargs) -> Iterator[GenericStreamingChunk]:
+        url, headers, payload = self._prepare_streaming_request(messages, **kwargs)
+        yield from self._process_streaming_events(url, headers, payload)
 
-        with EventSource(url, timeout=30, headers=headers, json=payload, method="POST") as event_source:
-            try:
-                for event in event_source:
-
-                    if event.type == "end_event":
-                        break
-                    if event.type != "new_message":
-                        continue
-                    try:
-                        data = json.loads(event.data)
-                        if "answer" in data and data["answer"]:  # Only add non-empty answers
-                            answer_parts.append(data["answer"])
-                    except Exception as e:
-                        print(f"Error parsing event data: {e}")
-                        continue    
-            except InvalidStatusCodeError:
-                pass
-            except InvalidContentTypeError:
-                pass
-            except requests.RequestException:
-                pass
-
-        event_source.close()    
-
-        content = "".join(answer_parts)
-        tool_calls, clean_content = self._detect_tool_calls(content)
-        resposta = self._format_openai_response(model, clean_content, tool_calls)
-        return resposta     
+    async def astreaming(self, model, messages, **kwargs) -> AsyncIterator[GenericStreamingChunk]:
+        url, headers, payload = self._prepare_streaming_request(messages, **kwargs)
+        for chunk in self._process_streaming_events(url, headers, payload):
+            yield chunk
 
 stackspot_llm = StackspotLLM()
 
@@ -409,7 +477,9 @@ litellm.custom_provider_map = [ # 👈 KEY STEP - REGISTER HANDLER
 
 resp = completion(
         model="my-custom-llm/stackspot-chat",
+        stream=True,
         messages=[{"role": "user", "content": "Hello world!"}])
 
 
-print(f"Response: {resp}")
+for chunk in resp:
+    print(chunk)
