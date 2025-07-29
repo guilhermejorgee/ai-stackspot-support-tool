@@ -1,4 +1,4 @@
-import os, json, re, time, uuid, requests, litellm, sseclient, logging
+import os, json, re, time, uuid, requests, litellm, logging
 from dotenv import load_dotenv
 from litellm import CustomLLM, ModelResponse, completion
 from litellm.types.utils import GenericStreamingChunk
