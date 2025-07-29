@@ -7,6 +7,8 @@ Exemplo de chatbot que integra três servidores MCP distintos:
   3) Servidor local de busca genérica
 """
 import os
+import httpx
+import ulid
 import logging
 import asyncio
 import time
@@ -39,11 +41,15 @@ logger = logging.getLogger(__name__)
 # ————————————————
 # O modelo pode ser OpenAI ou outro compatível
 
+# Create a custom httpx.AsyncClient with desired headers
+custom_client = httpx.AsyncClient(headers={"correlation-id": str(ulid.new())})
+
 model = OpenAIModel(
     'stackspot-chat',
     provider=OpenAIProvider(
         base_url='http://localhost:4000/v1',
         api_key='your-perplexity-api-key',
+        http_client=custom_client
     ),
 )
 

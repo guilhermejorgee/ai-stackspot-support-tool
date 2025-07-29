@@ -1,141 +1,262 @@
-# Integração PydanticAI + LiteLLM + Stackspot
+# Stackspot LiteLLM Proxy
 
-Este guia mostra como conectar um agente PydanticAI ao seu proxy LiteLLM local que utiliza o Stackspot como provider.
+Proxy LiteLLM altamente otimizado para integração com Stackspot AI, com suporte completo a streaming, tool calling e logging estratégico.
+
+## 🚀 Características Principais
+
+### ✅ Implementação Completa
+- **4 métodos LiteLLM**: `completion`, `acompletion`, `streaming`, `astreaming`
+- **Tool Calling**: Suporte total a ferramentas OpenAI-compatíveis
+- **Streaming SSE**: Resposta em tempo real com Server-Sent Events
+- **Correlation ID**: Suporte obrigatório para rastreamento de conversas
+
+### 🏗️ Arquitetura Refatorada
+- **~200 linhas eliminadas** através de métodos compartilhados
+- **Anti-over-engineering**: Apenas abstrações necessárias
+- **Métodos públicos minimalistas**: 1-3 linhas cada
+- **Código DRY**: Zero duplicação entre sync/async
+
+### 📊 Logging Estratégico
+- **Autenticação**: Sucesso/falha com detalhes
+- **Tool Calls**: Detecção e argumentos
+- **SSE Connections**: Monitoramento de conexões
+- **Performance**: Métricas de chunks processados
 
 ## 📋 Pré-requisitos
 
-1. **Instalar dependências**:
+### Dependências
 ```bash
 pip install -r requirements.txt
 ```
 
-2. **Verificar configuração do proxy**:
-   - Arquivo `config.yaml` configurado
-   - Custom handler `custom_handler.py` implementado
-   - Suporte a tools funcionando
-
-## 🚀 Como Usar
-
-### 1. Iniciar o Proxy LiteLLM
-
+### Variáveis de Ambiente
+Crie um arquivo `.env`:
 ```bash
+CLIENT_ID=seu_client_id_stackspot
+CLIENT_SECRET=seu_client_secret_stackspot
+REALM=seu_realm
+GENAI_AGENT_ID=seu_agent_id
+```
 
-# Opção 2: Comando direto
+## 🔧 Configuração
+
+### 1. Configurar config.yaml
+```yaml
+model_list:
+  - model_name: stackspot-chat
+    litellm_params:
+      model: stackspot-chat
+      custom_llm_provider: stackspot
+```
+
+### 2. Iniciar o Proxy
+```bash
 litellm --config config.yaml --port 4000
 ```
 
-O proxy ficará disponível em `http://localhost:4000`
+## 💻 Uso com PydanticAI
 
-### 2. Configurar PydanticAI
-
+### Configuração Básica
 ```python
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIModel
 
-# Configurar modelo para usar proxy local
+# Configurar modelo
 model = OpenAIModel(
-    model_name='stackspot-chat',  # Nome definido no config.yaml
-    base_url='http://localhost:4000/v1',  # URL do proxy
-    api_key='fake-key'  # Não é necessária chave real
+    model_name='stackspot-chat',
+    base_url='http://localhost:4000/v1',
+    api_key='fake-key'  # Não é necessária
 )
 
 # Criar agente com tools
 agent = Agent(
     model=model,
-    tools=[sua_funcao_tool1, sua_funcao_tool2],
+    tools=[sua_funcao_tool],
     system_prompt="Você é um assistente útil..."
 )
 ```
 
-### 3. Executar Agente
-
+### Com Correlation ID (Obrigatório)
 ```python
-# Executar consulta
-result = await agent.run("Sua pergunta aqui")
-print(result.data)
-```
+import httpx
 
-## 🔧 Configurações Avançadas
+# Cliente customizado com correlation ID
+client = httpx.AsyncClient(
+    headers={'correlation-id': 'sua-conversa-123'}
+)
 
-### Timeouts e Retries
-
-```python
 model = OpenAIModel(
     model_name='stackspot-chat',
     base_url='http://localhost:4000/v1',
-    api_key='fake-key'
+    api_key='fake-key',
+    http_client=client
 )
 ```
 
-### Variáveis de Ambiente
-
-Crie um arquivo `.env`:
-
-```bash
-LITELLM_BASE_URL=http://localhost:4000/v1
-LITELLM_MODEL_NAME=stackspot-chat
-LITELLM_API_KEY=fake-key
+### Executar com Streaming
+```python
+# Streaming automático com PydanticAI
+result = await agent.run("Sua pergunta aqui", stream=True)
+print(result.data)
 ```
 
-## 🛠️ Troubleshooting
+## 🛠️ Features Avançadas
 
-### Proxy não responde
-- Verifique se o proxy está rodando: `curl http://localhost:4000/health`
-- Confirme a porta: pode estar sendo usada por outro processo
-- Verifique logs do LiteLLM para erros de autenticação
+### Tool Calling
+O proxy detecta automaticamente tool calls do Stackspot:
+```
+FUNCTION_CALL_START
+function_name
+arguments: {"param": "value"}
+FUNCTION_CALL_END
+```
 
-### PydanticAI não encontra tools
-- Certifique-se de que o custom handler está detectando tool calls corretamente
-- Teste diretamente o proxy: `curl -X POST http://localhost:4000/v1/chat/completions`
-- Verifique se as tools estão sendo passadas no formato correto
+### Logging Configurável
+```python
+import logging
 
-### Erros de autenticação do Stackspot
-- Confirme as credenciais no `custom_handler.py`
-- Teste autenticação: `python debug_test.py`
-- Verifique se o JWT não expirou
+# Debug detalhado
+logging.getLogger('custom_handler').setLevel(logging.DEBUG)
 
-### Performance lenta
-- O Stackspot pode ter limitações de rate limiting
-- Considere implementar cache para respostas
-- Use connection pooling no httpx/requests
+# Produção (apenas erros)
+logging.getLogger('custom_handler').setLevel(logging.ERROR)
+```
+
+### Métricas de Performance
+- Tool calls detectados por requisição
+- Chunks de streaming processados  
+- Tamanho das respostas coletadas
+- Tempo de autenticação JWT
+
+## 🔍 Troubleshooting
+
+### Erro: "correlation_id ausente"
+```python
+# ✅ Correto - incluir header
+headers = {'correlation-id': 'conversa-123'}
+
+# ❌ Incorreto - sem header
+# Resultará em KeyError
+```
+
+### Autenticação Falhando
+```bash
+# Verificar logs
+tail -f litellm.log | grep "Authentication"
+
+# Testar manualmente
+python -c "from custom_handler import StackspotLLM; s=StackspotLLM(); s.authenticate()"
+```
+
+### Streaming Não Funciona
+```python
+# Verificar se está usando stream=True
+result = await agent.run("pergunta", stream=True)
+
+# Debug de conexão SSE
+logging.getLogger('custom_handler').setLevel(logging.DEBUG)
+```
+
+### Performance Lenta
+- **Rate Limiting**: Stackspot pode ter limites
+- **JWT Caching**: Tokens são reutilizados automaticamente  
+- **Connection Pooling**: Use `httpx.AsyncClient` persistente
 
 ## 📊 Monitoramento
 
-### Logs do Proxy
+### Logs Estratégicos
 ```bash
 # Iniciar com logs detalhados
-litellm --config config.yaml --port 4000 --verbose
+export PYTHONPATH=.
+litellm --config config.yaml --port 4000 --debug
+
+# Filtrar apenas erros críticos
+litellm --config config.yaml --port 4000 2>&1 | grep ERROR
 ```
 
-### Métricas do PydanticAI
+### Métricas em Tempo Real
+- `INFO`: Tool calls encontrados
+- `DEBUG`: Chunks de streaming processados
+- `ERROR`: Falhas de autenticação/conexão
+- `WARNING`: Parsing de eventos falhou
+
+## 🏛️ Arquitetura Interna
+
+### Métodos Públicos (Ultra-Simples)
 ```python
-# Acessar histórico de mensagens
-result = await agent.run("pergunta")
-print(f"Mensagens trocadas: {len(result.all_messages())}")
-print(f"Custo estimado: {result.cost()}")
+def completion(self, model, messages, **kwargs):
+    url, headers, payload = self._prepare_streaming_request(messages, **kwargs)
+    return self._collect_completion_response(url, headers, payload, model)
+
+def streaming(self, model, messages, **kwargs):
+    url, headers, payload = self._prepare_streaming_request(messages, **kwargs)
+    yield from self._process_streaming_events(url, headers, payload)
 ```
 
-## 🔗 Endpoints Disponíveis
+### Métodos Compartilhados
+- `_prepare_streaming_request()`: Setup comum
+- `_collect_completion_response()`: Coleta SSE para completion
+- `_process_streaming_events()`: Streaming em tempo real
+- `_process_tool_calls_streaming()`: Tool calls progressivos
+
+## 🚦 API Endpoints
 
 Quando o proxy estiver rodando:
 
-- **Chat**: `POST http://localhost:4000/v1/chat/completions`
-- **Models**: `GET http://localhost:4000/v1/models`  
+- **Chat Completions**: `POST http://localhost:4000/v1/chat/completions`
+- **Streaming**: Mesmo endpoint com `"stream": true`
+- **Models**: `GET http://localhost:4000/v1/models`
 - **Health**: `GET http://localhost:4000/health`
-- **Metrics**: `GET http://localhost:4000/metrics` (se habilitado)
 
 ## 📝 Exemplo Completo
 
-Veja `pydantic_agent_example.py` para um exemplo completo com:
-- Configuração do modelo
-- Definição de tools personalizadas  
-- Testes de diferentes cenários
-- Conversas multi-turn
-- Tratamento de erros
+```python
+import asyncio
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIModel
+import httpx
+
+async def main():
+    # Cliente com correlation ID
+    client = httpx.AsyncClient(
+        headers={'correlation-id': 'conversa-teste-123'}
+    )
+    
+    # Modelo configurado
+    model = OpenAIModel(
+        model_name='stackspot-chat',
+        base_url='http://localhost:4000/v1', 
+        api_key='fake-key',
+        http_client=client
+    )
+    
+    # Agente com tool
+    def buscar_tempo(cidade: str) -> str:
+        return f"Tempo em {cidade}: 25°C, ensolarado"
+    
+    agent = Agent(
+        model=model,
+        tools=[buscar_tempo],
+        system_prompt="Use as ferramentas disponíveis para responder."
+    )
+    
+    # Executar com streaming
+    result = await agent.run(
+        "Qual o tempo em São Paulo?",
+        stream=True
+    )
+    
+    print(f"Resposta: {result.data}")
+    print(f"Tool calls: {len([m for m in result.all_messages() if m.role == 'tool'])}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
 
 ## 🎯 Próximos Passos
 
-1. **Produção**: Configure HTTPS, autenticação e rate limiting
-2. **Monitoramento**: Adicione métricas e alertas
-3. **Scaling**: Use load balancer para múltiplas instâncias
-4. **Cache**: Implemente cache para respostas frequentes
+1. **Produção**: HTTPS, autenticação, rate limiting
+2. **Observabilidade**: Prometheus metrics, OpenTelemetry  
+3. **Scaling**: Load balancer, múltiplas instâncias
+4. **Cache**: Redis para respostas frequentes
+5. **Monitoring**: Health checks, alertas automáticos
